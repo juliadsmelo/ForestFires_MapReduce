@@ -1,33 +1,49 @@
-# ----------------------------------------------------------------
-# CLASSE 2 — Reducer
-# ----------------------------------------------------------------
-import csv
-import sys
-from collections import defaultdict
-import numpy as np
-import pandas as pd
-from scipy import stats
+# reducer.py
+# FASE REDUCE: soma as parciais recebidas e aplica Pearson com os totais globais.
+import math
+
 
 class Reducer:
-    # Recebe os pares agrupados por chave (mês) e calcula a temperatura média, mediana, desvio padrão e contagem.
-
-    def reduce(self, mapped_pairs: list[tuple[str, float]]) -> dict:
-        # Agrupar valores por chave
-        groups: dict[str, list[float]] = defaultdict(list)
-        for key, value in mapped_pairs:
-            groups[key].append(value)
-        
+    def reduce(self, partition: dict) -> dict:
+        """partition = {chave: [tuplas de 6 somas]} (ja agrupado pelo Shuffle)."""
         results = {}
-        for key in sorted(groups.keys()):
-            temps = groups[key]
-            results[key] = {
-                "count": len(temps),
-                "mean": round(np.mean(temps), 2),
-                "median": round(np.median(temps), 2),
-                "std": round(np.std(temps, ddof=1), 2) if len(temps) > 1 else
-0.0,
-                "min": round(min(temps), 2),
-                "max": round(max(temps), 2),
+
+        for col_name in sorted(partition.keys()):
+            totals = [0.0] * 6
+            for partial in partition[col_name]:
+                for i, v in enumerate(partial):
+                    totals[i] += v
+
+            sx, sy, sx2, sy2, sxy, n = totals
+            n = int(n)
+
+            # r = (N*Sxy - Sx*Sy) / sqrt((N*Sx2 - Sx^2) * (N*Sy2 - Sy^2))
+            numerator = n * sxy - sx * sy
+            denom_x = n * sx2 - sx ** 2
+            denom_y = n * sy2 - sy ** 2
+
+            if n < 2 or denom_x <= 0 or denom_y <= 0:
+                r = float("nan")  # correlacao indefinida (variancia zero), nao e 0
+            else:
+                r = numerator / math.sqrt(denom_x * denom_y)
+
+            results[col_name] = {
+                "n": n,
+                "pearson_r": r,
+                "strength": self._interpret(r),
             }
-        print(f"[Reducer] {len(results)} chaves (meses) reduzidas.")
+
         return results
+
+    @staticmethod
+    def _interpret(r: float) -> str:
+        if math.isnan(r):
+            return "INDEFINIDA"
+        v = abs(r)
+        if v >= 0.7:
+            return "FORTE"
+        if v >= 0.4:
+            return "MODERADA"
+        if v >= 0.2:
+            return "FRACA"
+        return "MUITO FRACA / DESPREZIVEL"

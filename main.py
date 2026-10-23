@@ -1,146 +1,127 @@
-from mapper import Mapper      # puxa a classe do mapper.py
-from reducer import Reducer    # puxa a classe do reducer.py
+# main.py - Orquestrador do pipeline MapReduce com Combiner
+# Uso: python main.py
+# Requisitos: pip install pandas scipy
+import math
+import zlib
+from collections import Counter, defaultdict
 
-import csv
-import sys
-from collections import defaultdict
-import numpy as np
 import pandas as pd
 from scipy import stats
 
-# ----------------------------------------------------------------
-# CLASSE 3 — Main (Orquestrador)
-# ----------------------------------------------------------------
+from mapper import Mapper
+from combiner import Combiner
+from reducer import Reducer
+
+
 class Main:
-
-    # Orquestra o pipeline MapReduce e executa a análise
-    # aprofundada (correlações, outliers e hipóteses).
-
     FILEPATH = "forestfireinput.csv"
-    COLUMNS = ["X","Y","month","day","FFMC","DMC","DC","ISI", "temp","RH","wind","rain","area"]
-    MONTH_ORDER = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"]
+    NUM_NODES = 3       # simula 3 slaves
+    NUM_REDUCERS = 2    # simula 2 reducers para mostrar o particionamento por chave
+    COLUMNS = ["X", "Y", "month", "day", "FFMC", "DMC",
+               "DC", "ISI", "temp", "RH", "wind", "rain", "area"]
 
     def run(self):
-        print("=" * 65)
-        print(" FASE 1 — MapReduce: Temperatura Média por Mês")
-        print("=" * 65)
-        self._run_mapreduce()
-        print("\n" + "=" * 65)
-        print(" FASE 2 — Análise Aprofundada (Correlações e Outliers)")
-        print("=" * 65)
-        df = self._load_dataframe()
-        self._correlation_analysis(df)
+        results, counters, has_header = self._run_mapreduce()
+
+        header = 0 if has_header else None
+        df = pd.read_csv(self.FILEPATH, header=header, names=self.COLUMNS)
+
+        self._check_integrity(results, counters, df)
+        self._verify_against_pandas(results, df)
         self._outlier_analysis(df)
-        self._hypothesis_and_conclusions(df)
 
+    # ---------------------------------------------------------------- MapReduce
     def _run_mapreduce(self):
-        mapper = Mapper(self.FILEPATH)
+        # PASSO 1 - SPLIT: divide as linhas em N pedacos (simula blocos do HDFS)
+        with open(self.FILEPATH, "r", encoding="utf-8") as f:
+            all_lines = f.readlines()
+
+        has_header = bool(all_lines) and all_lines[0].strip().startswith("X")
+
+        split_size = math.ceil(len(all_lines) / self.NUM_NODES)
+        splits = [all_lines[i * split_size:(i + 1) * split_size]
+                  for i in range(self.NUM_NODES)]
+
+        # Integridade 1: nenhuma linha pode se perder na divisao
+        assert sum(len(s) for s in splits) == len(all_lines), "Split perdeu linhas!"
+
+        # PASSOS 2 e 3 - MAP + COMBINE, local em cada no
+        total_counters = Counter()
+        combined_all = []
+        combiner = Combiner()
+
+        for i, split in enumerate(splits, start=1):
+            mapper = Mapper()                       # um Mapper por no
+            mapped = mapper.map(split)              # MAP
+            combined = combiner.combine(mapped)     # COMBINE
+            combined_all.extend(combined)
+            total_counters.update(mapper.counters)
+            print(f"No {i}: {len(split)} linhas | {len(mapped)} pares emitidos "
+                  f"-> {len(combined)} apos Combiner")
+
+        # PASSO 4 - SHUFFLE & SORT: particiona por hash da CHAVE.
+        # crc32 e estavel (o hash() de str do Python muda a cada execucao).
+        partitions = [defaultdict(list) for _ in range(self.NUM_REDUCERS)]
+        for key, value in combined_all:
+            p = zlib.crc32(key.encode("utf-8")) % self.NUM_REDUCERS
+            partitions[p][key].append(value)
+
+        # PASSO 5 - REDUCE: cada reducer processa so as chaves da sua particao
         reducer = Reducer()
-        pairs = mapper.map() # MAP
-        results = reducer.reduce(pairs) # REDUCE
+        results = {}
+        for p, part in enumerate(partitions):
+            print(f"Reducer {p}: colunas {sorted(part.keys())}")
+            results.update(reducer.reduce(part))
 
-        print(f"\n{'Mês':<6} {'N':>5} {'Média':>7} {'Mediana':>8} "
-              f"{'DP':>7} {'Mín':>6} {'Máx':>6}")
-        print("-" * 50)
-        for m in self.MONTH_ORDER:
-            if m in results:
-                r = results[m]
-                print(f"{m:<6} {r['count']:>5} {r['mean']:>7.2f} "
-                      f"{r['median']:>8.2f} {r['std']:>7.2f} "
-                      f"{r['min']:>6.1f} {r['max']:>6.1f}")
-                
-        all_temps = [pair[1] for pair in Mapper(self.FILEPATH).map()]
-        print(f"\n>>> Temperatura média GLOBAL: {np.mean(all_temps):.2f} °C")
-        print(">>> ATENÇÃO: essa média global esconde variações enormes!")
+        return results, total_counters, has_header
 
-    def _load_dataframe(self) -> pd.DataFrame:
-        return pd.read_csv(self.FILEPATH, header=None, names=self.COLUMNS)
+    # ---------------------------------------------------------------- Integridade
+    def _check_integrity(self, results, counters, df):
+        print("\n=== Contadores (integridade) ===")
+        for k, v in sorted(counters.items()):
+            print(f"  {k}: {v}")
 
+        # Integridade 2: todo registro valido do CSV passou pelo MapReduce
+        assert counters["registros_validos"] == len(df), \
+            f"MapReduce viu {counters['registros_validos']} registros, CSV tem {len(df)}"
 
-    def _correlation_analysis(self, df: pd.DataFrame):
-        numeric_cols = ["X","Y","FFMC","DMC","DC","ISI",
-                        "temp","RH","wind","rain","area"]
+        # Integridade 3: toda coluna recebeu exatamente todos os registros
+        for col, res in results.items():
+            assert res["n"] == len(df), f"Coluna {col}: n={res['n']} != {len(df)}"
 
-        print("\n--- CORRELAÇÃO DE PEARSON (com temp) ---")
-        corr = df[numeric_cols].corr()
-        temp_corr = corr["temp"].drop("temp").sort_values(
-            key=abs, ascending=False)
-        for col, val in temp_corr.items():
-            strength = self._interpret_corr(val)
-            print(f"  temp x {col:<6} = {val:>+.4f}  ({strength})")
+        print(f"  OK: {len(df)} registros em todas as {len(results)} colunas.")
 
+    def _verify_against_pandas(self, results, df):
+        print("\n=== Verificacao: MapReduce x pandas x Spearman (temp vs coluna) ===")
+        rows = []
+        for col, res in results.items():
+            mr = res["pearson_r"]
+            pd_r = df["temp"].corr(df[col])                 # sem arredondar
+            rho, _ = stats.spearmanr(df["temp"], df[col])   # fora do MapReduce
+            diff = abs(mr - pd_r)
 
-        print("\n--- TOP 10 PARES (valor absoluto) ---")
-        pairs_seen = set()
-        ranked = []
-        for c1 in numeric_cols:
-            for c2 in numeric_cols:
-                if c1 >= c2: continue
-                if (c1,c2) not in pairs_seen:
-                    pairs_seen.add((c1,c2))
-                    ranked.append((c1, c2, corr.loc[c1, c2]))
-        ranked.sort(key=lambda x: abs(x[2]), reverse=True)
-        for c1, c2, val in ranked[:10]:
-            print(f"  {c1:<6} x {c2:<6} = {val:>+.4f}")
+            # Se divergir, o programa PARA (nao so imprime)
+            assert diff < 1e-9, f"{col}: MapReduce={mr} pandas={pd_r} diff={diff}"
+            rows.append((col, mr, pd_r, rho, res["strength"]))
 
+        rows.sort(key=lambda r: abs(r[1]), reverse=True)  # ordenado por forca
+        print(f"  {'col':<5} {'MapReduce':>10} {'pandas':>10} {'Spearman':>10}  forca")
+        for col, mr, pd_r, rho, strength in rows:
+            print(f"  {col:<5} {mr:>+10.4f} {pd_r:>+10.4f} {rho:>+10.4f}  {strength}")
+        print("  OK: MapReduce identico ao pandas (diferenca < 1e-9).")
 
-        print("\n--- CORRELAÇÃO DE SPEARMAN (com temp) ---")
-        for col in numeric_cols:
-            if col == "temp": continue
-            rho, pval = stats.spearmanr(df["temp"], df[col])
-            sig = "***" if pval < 0.001 else ("**" if pval < 0.01 else
-                  ("*" if pval < 0.05 else "ns"))
-            print(f"  temp x {col:<6} = {rho:>+.4f}  (p={pval:.4f}) {sig}")
-
-
-    def _outlier_analysis(self, df: pd.DataFrame):
-        print("\n--- DETECÇÃO DE OUTLIERS (método IQR x 1.5) ---")
-        numeric_cols = ["FFMC","DMC","DC","ISI","temp","RH","wind","rain","area"]
-        for col in numeric_cols:
-            q1 = df[col].quantile(0.25)
-            q3 = df[col].quantile(0.75)
+    # ---------------------------------------------------------------- Outliers
+    def _outlier_analysis(self, df):
+        print("\n=== Outliers (metodo IQR) ===")
+        for col in ["temp", "FFMC", "rain", "area"]:
+            q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
             iqr = q3 - q1
-            lower = q1 - 1.5 * iqr
             upper = q3 + 1.5 * iqr
-            outliers = df[(df[col] < lower) | (df[col] > upper)]
-            pct = len(outliers) / len(df) * 100
-            print(f"  {col:<6}: {len(outliers):>3} outliers ({pct:.1f}%)")
+            n_out = int((df[col] > upper).sum())
+            print(f"  {col:<5} limite sup={upper:8.2f}  outliers={n_out:3d} "
+                  f"({100 * n_out / len(df):.1f}%)  media={df[col].mean():.2f} "
+                  f"mediana={df[col].median():.2f}")
 
 
-        print("\n--- OUTLIERS DE temp POR Z-SCORE (|z| > 2) ---")
-        z_temp = np.abs(stats.zscore(df["temp"]))
-        outliers_z = df[z_temp > 2]
-        print(f"  {len(outliers_z)} registros com |z| > 2 para temperatura")
-
-
-    def _hypothesis_and_conclusions(self, df):
-        print("\n" + "=" * 65)
-        print("  FASE 3 — Hipóteses e Conclusões para a Defesa")
-        print("=" * 65)
-        print("Ver documento de estudo para argumentos completos.")
-
-
-    @staticmethod
-    def _interpret_corr(val: float) -> str:
-        v = abs(val)
-        if v >= 0.7:   return "forte"
-        elif v >= 0.4: return "moderada"
-        elif v >= 0.2: return "fraca"
-        else:          return "muito fraca / desprezível"
-
-
-
-
-# ================================================================
-# PONTO DE ENTRADA
-# ================================================================
 if __name__ == "__main__":
     Main().run()
-
-
-
-
-    
-
-            
-
